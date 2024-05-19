@@ -4,7 +4,7 @@ use tokio::{
     process::Command,
     sync::mpsc::Sender,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub fn launch(
     driver: &str,
@@ -69,8 +69,10 @@ pub fn launch(
 
         info!("killing recisdb with PID: {:?}", command.id());
 
-        if command.try_wait().is_err() {
-            command.kill().await.unwrap();
+        let result = command.kill().await;
+
+        if result.is_err() {
+            warn!("Failed to kill recisdb with PID: {:?}", command.id());
         }
 
         sender.closed().await;
