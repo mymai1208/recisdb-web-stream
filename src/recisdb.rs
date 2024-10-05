@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use crate::MAX_BUFFER_SIZE;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -7,24 +9,22 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 pub fn launch(
-    driver: &str,
+    driver: String,
     channel: &str,
     is_encoding: bool,
     sender: Sender<Vec<u8>>,
+    tuners_arc: &Arc<Mutex<Vec<String>>>,
 ) -> Result<(), std::io::Error> {
     info!(
         "Launching recisdb with driver: {} and channel: {}",
         driver, channel
     );
 
-    let _driver = driver.to_string();
-    let _channel = channel.to_string();
-
     let mut command = if is_encoding {
         Box::new(
             Command::new("./ffmpeg_pipe.sh")
-                .arg(_driver)
-                .arg(_channel)
+                .arg(&driver)
+                .arg(channel)
                 .stdout(std::process::Stdio::piped())
                 .spawn()?,
         )
@@ -33,15 +33,17 @@ pub fn launch(
             Command::new("recisdb")
                 .arg("tune")
                 .arg("--device")
-                .arg(_driver)
+                .arg(&driver)
                 .arg("--no-strip")
                 .arg("--channel")
-                .arg(_channel)
+                .arg(channel)
                 .arg("-")
                 .stdout(std::process::Stdio::piped())
                 .spawn()?,
         )
     };
+
+    let active_tuners_arc: Arc<Mutex<Vec<String>>> = Arc::clone(tuners_arc);
 
     tokio::spawn(async move {
         info!("Launched recisdb with PID: {:?}", command.id());
@@ -67,15 +69,22 @@ pub fn launch(
             }
         }
 
+        active_tuners_arc
+            .lock()
+            .unwrap()
+            .retain(|tuner| !tuner.contains(&driver));
+
+        info!("deleted active tuner: {}", driver);
+
         info!("killing recisdb with PID: {:?}", command.id());
+
+        sender.closed().await;
 
         let result = command.kill().await;
 
         if result.is_err() {
             warn!("Failed to kill recisdb with PID: {:?}", command.id());
         }
-
-        sender.closed().await;
     });
 
     Ok(())

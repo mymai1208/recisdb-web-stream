@@ -1,21 +1,19 @@
-use std::io::Result;
+use std::{
+    io::Result,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
-    body::{Body, HttpBody},
-    extract::Path,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-    Json, Router,
+    body::{Body, HttpBody}, extract::{Path, State}, http::StatusCode, response::IntoResponse, routing::get, Json, Router
 };
 use futures::StreamExt;
-use rand::seq::IteratorRandom;
 use serde::Serialize;
 use tokio::{
     net::TcpListener,
     sync::mpsc::{self, Receiver, Sender},
 };
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::info;
 
 use crate::{recisdb, CONFIG, MAX_BUFFER_SIZE};
 
@@ -29,15 +27,21 @@ struct ChannelJson {
 }
 
 pub async fn init_server() {
+    let tuners_arc = Arc::new(Mutex::new(vec![]));
+
     let app: Router = Router::new()
         .route("/stream/:channel_id", get(stream_handler))
+        .with_state(tuners_arc)
         .route("/channels", get(get_channels_handler));
     let listener = TcpListener::bind("0.0.0.0:4000").await.unwrap();
 
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn stream_handler(Path(channel_id): Path<String>) -> impl IntoResponse {
+async fn stream_handler(
+    Path(channel_id): Path<String>,
+    State(tuner_arc): State<Arc<Mutex<Vec<String>>>>,
+) -> impl IntoResponse {
     let config = CONFIG.lock().unwrap();
 
     let channel = config
@@ -48,6 +52,7 @@ async fn stream_handler(Path(channel_id): Path<String>) -> impl IntoResponse {
         .next();
 
     if channel.is_none() {
+        info!("Channel not found");
         let mut response = Body::new("Channel not found".to_string()).into_response();
 
         *response.status_mut() = StatusCode::NOT_FOUND;
@@ -57,24 +62,31 @@ async fn stream_handler(Path(channel_id): Path<String>) -> impl IntoResponse {
 
     let (sender, receiver): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel(MAX_BUFFER_SIZE);
 
+    let mut active_tuners = tuner_arc.lock().unwrap();
+
     let driver = config
         .tuners
         .iter()
         .filter(|tuner| tuner.types.contains(&channel.unwrap().r#type))
-        .choose(&mut rand::thread_rng())
-        .take();
+        .find(|tuner| !active_tuners.contains(&tuner.name));
 
     if driver.is_none() {
         let mut response = Body::new("Driver not found".to_string()).into_response();
 
         *response.status_mut() = StatusCode::NOT_FOUND;
 
+        info!("Driver is full");
+
         return response;
     }
 
     let args: Vec<&str> = driver.unwrap().command.split_ascii_whitespace().collect();
 
-    recisdb::launch(args[5], &channel_id, false, sender).unwrap();
+    if recisdb::launch(args[5].to_string(), &channel_id, false, sender, &tuner_arc).is_err() {
+        return Body::new("Failed to launch recisdb".to_string()).into_response();
+    }
+
+    active_tuners.push(args[5].to_string());
 
     let stream = ReceiverStream::new(receiver).map(Result::Ok);
 
